@@ -1,11 +1,14 @@
+import json
 import random
 import re
 
 from .common import InfoExtractor
 from ..compat import (
+    asyncio,
     compat_str,
     compat_urlparse,
 )
+from ..dependencies import websockets
 from ..utils import (
     encode_data_uri,
     ExtractorError,
@@ -14,6 +17,7 @@ from ..utils import (
     join_nonempty,
     mimetype2ext,
     str_or_none,
+    traverse_obj,
 )
 
 
@@ -77,6 +81,48 @@ class UstreamIE(InfoExtractor):
             r'<iframe[^>]+?src=(["\'])(?P<url>https?://(?:www\.)?(?:ustream\.tv|video\.ibm\.com)/embed/.+?)\1', webpage)
         if mobj is not None:
             return mobj.group('url')
+
+    async def _get_formats_from_websockets(self, video_id):
+        url = None
+        rnd = random.randrange
+
+        self._download_json('https://video.ibm.com/ajax/util/country/get.json', video_id, note='Pre Request')
+        self._download_json('https://crt-event-ingest.services.video.ibm.com/time', video_id, note='Pre Request2')
+
+        baseurl = f'r{rnd(1e8)}-1-{video_id}-recorded-wss-omega.ums.services.video.ibm.com'
+        self._download_json(f'https://{baseurl}/connectioncheck', video_id, note='Check Connection')
+
+        async with websockets.connect(f'wss://{baseurl}/1/ustream', extra_headers={'Origin': 'https://video.ibm.com'}) as websocket:
+            command = {
+                'cmd': 'connect',
+                'args': [{
+                    'type': 'viewer',
+                    'appId': 7,
+                    'appVersion': 1,
+                    'rsid': f'{hex(rnd(1e10))[2:10]}:{hex(rnd(1e10))[2:10]}',
+                    'rpin': f'_rpin.{rnd(1e18)}',
+                    'referrer': f'https://video.ibm.com/recorded/{video_id}',
+                    'media': f'{video_id}',
+                    'application': 'recorded',
+                    'buildNumber': '2.40.0',
+                    'ignoreTrim': True,
+                    'cluste rHost': 'r%rnd%-1-%mediaId%-%mediaType%-%protocolPrefix%-%cluster%.ums.services.video.ibm.com',
+                }]
+            }
+
+            await websocket.send(json.dumps(command))
+            wait = True
+            while wait:
+                response = await websocket.recv()
+                response = json.loads(response)
+                url = traverse_obj(response, ('args', 0, 'stream', 'streamFormats', 'hls/mp4/rfc', 'contentAccess', 'accessList', 0, 'data', 'url'))
+                if url:
+                    wait = False
+                    url += '&cdnHost=__host__'
+                    formats = self._extract_m3u8_formats(url, video_id, ext='mp4', m3u8_id='hls')
+                    self._sort_formats(formats)
+                    return formats
+        return None
 
     def _get_stream_info(self, url, video_id, app_id_ver, extra_note=None):
         def num_to_hex(n):
@@ -201,6 +247,11 @@ class UstreamIE(InfoExtractor):
             'ext': format_id,
             'filesize': filesize,
         } for format_id, video_url in video['media_urls'].items() if video_url]
+
+        if websockets:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            formats = loop.run_until_complete(self._get_formats_from_websockets(video_id))
 
         if not formats:
             hls_streams = self._get_streams(url, video_id, app_id_ver=(11, 2))
